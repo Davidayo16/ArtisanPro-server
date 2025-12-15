@@ -1,8 +1,10 @@
+// backend/routes/paymentRoutes.js
 import express from "express";
 import {
   initializePaymentHandler,
   verifyPaymentHandler,
   getPayment,
+  verifyPaymentStream, // ✅ NEW IMPORT
 } from "../controllers/payment/paystackController.js";
 import {
   releaseEscrowHandler,
@@ -23,7 +25,13 @@ router.use(protect);
 
 // Payment routes
 router.post("/initialize", authorize("customer"), initializePaymentHandler);
+
+// ✅ NEW: SSE stream verification (use this for real-time progress)
+router.get("/verify-stream/:reference", verifyPaymentStream);
+
+// Original verify (keep as fallback)
 router.get("/verify/:reference", verifyPaymentHandler);
+
 router.get("/:id", getPayment);
 
 // Escrow routes

@@ -252,3 +252,207 @@ export const getPayment = async (req, res) => {
     });
   }
 };
+
+// ========== ✅ NEW: SSE STREAM VERIFICATION ==========
+export const verifyPaymentStream = async (req, res) => {
+  const { reference } = req.params;
+
+  // Set SSE headers
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // Disable nginx buffering
+
+  // Helper to send events
+  const sendEvent = (event, data) => {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  try {
+    // ========== STEP 1: VERIFY PAYMENT ==========
+    sendEvent("progress", {
+      step: 1,
+      message: "Verifying payment...",
+      status: "loading",
+    });
+
+    const payment = await Payment.findOne({ paystackReference: reference });
+
+    if (!payment) {
+      sendEvent("error", {
+        step: 1,
+        message: "Payment record not found",
+        status: "error",
+      });
+      return res.end();
+    }
+
+    // Check if already processed
+    if (payment.status === "successful") {
+      const booking = await Booking.findById(payment.booking)
+        .populate("artisan", "firstName lastName businessName")
+        .populate("service", "name")
+        .populate("customer", "firstName lastName");
+
+      sendEvent("progress", {
+        step: 1,
+        message: "Payment already verified",
+        status: "success",
+      });
+
+      sendEvent("progress", {
+        step: 2,
+        message: "Booking already confirmed",
+        status: "success",
+      });
+
+      sendEvent("progress", {
+        step: 3,
+        message: "Setup complete",
+        status: "success",
+      });
+
+      sendEvent("complete", {
+        payment,
+        booking,
+      });
+
+      return res.end();
+    }
+
+    // Verify with Paystack
+    const paystackData = await verifyPayment(reference);
+
+    if (paystackData.status !== "success") {
+      payment.status = "failed";
+      payment.failedAt = new Date();
+      payment.failureReason = paystackData.gateway_response;
+      await payment.save();
+
+      sendEvent("error", {
+        step: 1,
+        message: "Payment verification failed",
+        status: "error",
+        reason: paystackData.gateway_response,
+      });
+
+      return res.end();
+    }
+
+    sendEvent("progress", {
+      step: 1,
+      message: "Payment verified successfully",
+      status: "success",
+    });
+
+    // ========== STEP 2: CONFIRM BOOKING ==========
+    sendEvent("progress", {
+      step: 2,
+      message: "Confirming your booking...",
+      status: "loading",
+    });
+
+    // Update payment
+    payment.status = "successful";
+    payment.paidAt = new Date();
+    payment.paystackResponse = paystackData;
+    await payment.save();
+
+    // Update booking
+    const booking = await Booking.findById(payment.booking)
+      .populate("artisan", "firstName lastName businessName")
+      .populate("service", "name")
+      .populate("customer", "firstName lastName");
+
+    if (!booking) {
+      sendEvent("error", {
+        step: 2,
+        message: "Booking not found",
+        status: "error",
+      });
+      return res.end();
+    }
+
+    booking.status = "confirmed";
+    booking.paymentStatus = "paid";
+    booking.payment = payment._id;
+    booking.confirmedAt = new Date();
+    await booking.save();
+
+    sendEvent("progress", {
+      step: 2,
+      message: "Booking confirmed",
+      status: "success",
+    });
+
+    // ========== STEP 3: FINALIZE SETUP ==========
+    sendEvent("progress", {
+      step: 3,
+      message: "Finalizing setup...",
+      status: "loading",
+    });
+
+    let hasWarning = false;
+    let warningMessage = "";
+
+    // Create escrow (non-critical)
+    try {
+      await createEscrow(booking._id, payment._id);
+    } catch (escrowError) {
+      console.error("⚠️ Escrow creation error:", escrowError.message);
+      hasWarning = true;
+      warningMessage = "Escrow setup pending";
+    }
+
+    // Send notifications (non-critical)
+    try {
+      await Promise.allSettled([
+        sendNotification(payment.customer.toString(), "payment_confirmed", {
+          booking,
+          payment,
+        }),
+        sendNotification(payment.artisan.toString(), "payment_confirmed", {
+          booking,
+          payment,
+        }),
+      ]);
+    } catch (notifError) {
+      console.error("⚠️ Notification error:", notifError.message);
+      hasWarning = true;
+      if (!warningMessage) warningMessage = "Notifications pending";
+    }
+
+    if (hasWarning) {
+      sendEvent("progress", {
+        step: 3,
+        message: warningMessage,
+        status: "warning",
+      });
+    } else {
+      sendEvent("progress", {
+        step: 3,
+        message: "Setup complete",
+        status: "success",
+      });
+    }
+
+    // ========== SEND COMPLETE EVENT ==========
+    sendEvent("complete", {
+      payment,
+      booking,
+    });
+
+    res.end();
+  } catch (error) {
+    console.error("❌ SSE verification error:", error);
+
+    sendEvent("error", {
+      message: "An unexpected error occurred",
+      status: "error",
+      error: error.message,
+    });
+
+    res.end();
+  }
+};
